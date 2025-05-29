@@ -1,0 +1,40 @@
+from flask import Flask, render_template, jsonify
+from bot import load_prices_from_file, format_ton
+from datetime import datetime
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    """Главная страница"""
+    return render_template('index.html')
+
+@app.route('/api/prices')
+def get_prices():
+    """API эндпоинт для получения цен"""
+    prices = load_prices_from_file()
+    if not prices:
+        return jsonify({'error': 'Не удалось загрузить цены'}), 500
+    
+    # Преобразуем цены в формат для фронтенда
+    formatted_prices = []
+    for collection_id, price_data in prices.items():
+        formatted_prices.append({
+            'id': collection_id,
+            'name': price_data['name'],
+            'price': format_ton(int(price_data['price'])),
+            'raw_price': int(price_data['price']),
+            'address': price_data['address'],
+            'timestamp': price_data['timestamp'].strftime('%H:%M:%S')
+        })
+    
+    # Сортируем по цене
+    formatted_prices.sort(key=lambda x: x['raw_price'])
+    
+    return jsonify({
+        'prices': formatted_prices,
+        'last_update': min(p['timestamp'] for p in formatted_prices)
+    })
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000) 
