@@ -1,0 +1,16 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Telegram Bot Token (получить у @BotFather)
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+
+# GetGems API endpoints
+GETGEMS_API_URL = "https://api.getgems.io/graphql"
+
+# Интервал обновления цен (в секундах)
+UPDATE_INTERVAL = 60
+
+# Минимальная цена для уведомления (в TON)
+MIN_PRICE_ALERT = 1.0
