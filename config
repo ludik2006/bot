@@ -1,0 +1,584 @@
+#убрать нф неймс
+#пока не 57 из 57 подарков бот не дает ответа
+
+import os
+import json
+import time
+import requests
+import telebot
+import asyncio
+import httpx
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from flask import Flask, render_template, jsonify
+import subprocess
+import atexit
+
+# Загрузка переменных окружения
+load_dotenv()
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+
+# Инициализация Flask
+app = Flask(__name__)
+
+# URL от запущенного ngrok (нужно заменить на актуальный после запуска ngrok)
+# 1. Запустите в отдельном терминале: ngrok http 5000
+# 2. Скопируйте URL из вывода ngrok
+# 3. Вставьте его сюда
+WEBAPP_URL = "https://your-ngrok-url.ngrok-free.app"  # Замените на URL из ngrok
+
+# Очистка при выходе
+def cleanup():
+    pass
+
+atexit.register(cleanup)
+
+# Инициализация бота
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# Кэш для хранения цен
+price_cache = {}
+CACHE_DURATION = timedelta(minutes=10)  # Увеличиваем время кэширования до 10 минут
+RATE_LIMIT_WINDOW = 60  # окно в секундах для отслеживания запросов
+MAX_REQUESTS_PER_WINDOW = 30  # максимальное количество запросов в окне
+request_timestamps = []
+
+# Константы для GetGems API
+GETGEMS_RATE_LIMIT_WINDOW = 60  # окно в секундах
+GETGEMS_MAX_REQUESTS = 50  # максимальное количество запросов в минуту
+getgems_request_timestamps = []
+
+# Путь к файлу с ценами
+PRICES_FILE = "nft_prices.json"
+
+def check_rate_limit():
+    """Проверка ограничения запросов"""
+    current_time = time.time()
+    # Удаляем старые метки времени
+    while request_timestamps and current_time - request_timestamps[0] > RATE_LIMIT_WINDOW:
+        request_timestamps.pop(0)
+    # Проверяем, не превышен ли лимит
+    return len(request_timestamps) < MAX_REQUESTS_PER_WINDOW
+
+def add_request_timestamp():
+    """Добавление метки времени запроса"""
+    request_timestamps.append(time.time())
+
+def check_getgems_rate_limit():
+    """Проверка ограничения запросов к GetGems API"""
+    current_time = time.time()
+    # Удаляем старые метки времени
+    while getgems_request_timestamps and current_time - getgems_request_timestamps[0] > GETGEMS_RATE_LIMIT_WINDOW:
+        getgems_request_timestamps.pop(0)
+    # Проверяем, не превышен ли лимит
+    return len(getgems_request_timestamps) < GETGEMS_MAX_REQUESTS
+
+def add_getgems_request_timestamp():
+    """Добавление метки времени запроса к GetGems API"""
+    getgems_request_timestamps.append(time.time())
+
+# Константы
+COLLECTIONS = {
+    "PlushPepes": "EQBG-g6ahkAUGWpefWbx-D_9sQ8oWbvy6puuq78U2c4NUDFS",
+    "ToyBears": "EQC1gud6QO8NdJjVrqr7qFBMO0oQsktkvzhmIRoMKo8vxiyL",
+    "SwissWatches": "EQBI07PXew94YQz7GwN72nPNGF6htSTOJkuU4Kx_bjTZv32U",
+    "PreciousPeaches": "EQA4i58iuS9DUYRtUZ97sZo5mnkbiYUBpWXQOe3dEUCcP1W8",
+    "LootBags": "EQCE80Aln8YfldnQLwWMvOfloLGgmPY0eGDJz9ufG3gRui3D",
+    "DurovsCaps": "EQD9ikZq6xPgKjzmdBG0G0S80RvUJjbwgHrPZXDKc_wsE84w",
+    "LolPops": "EQC6zjid8vJNEWqcXk10XjsdDLRKbcPZzbHusuEW6FokOWIm",
+    "PartySparklers": "EQCa1I09fE9UoTV6awM6QC9-fkv51hoii24w1tJoFfigG_ax",
+    "ScaredCats": "EQATuUGdvrjLvTWE5ppVFOVCqU2dlCLUnKTsu0n1JYm9la10",
+    "SignetRings": "EQCrGA9slCoksgD-NyRDjtHySKN0Ts8k6hdueJkUkZZdD4_K",
+    "DiamondRings": "EQCWh1lPltyTwCWxCXm4umL5tPZoXR8kTIcT-pd0JqoadLHo",
+    "VoodooDolls": "EQCNsmpHqRSY_Dxnyh6P0MMO7zcABf8sVvG0wr245pBzO3B3",
+    "EasterEggs": "EQAwnP7dGfE_WO0xiCiulkAXUG1K1bWH1vE1k64T4G-7gruO",
+    "SpicedWines": "EQA8DCWyCWyywgOKYORerRoSVevWrUQ_FjKQgNihxY1227x7",
+    "GoldBars": "EQA401QqpXtBnwIaDbFjwd5yXfP2mYiCusbJ3Zcw9eXR9CqL",
+    "Champagne": "EQCyAMkb6bNyNlKPH0tJbubk1VVjASqyq9sZwkJ8AbxMkxxU",
+    "Skateboard": "EQDTro-ogJbS7o-OBD6bt2NysPt7SnGm5zfuRXGB1nE_rbGa",
+    "GamingConsole": "EQD6mH9bwbn6S3M_tCRWOvqAIW8M34kRwbI01niGLRPeDPsl",
+    "Sneakers": "EQD7yDu2WCgd9Uzx1dF_DQkWK7IZJJ4Mp9M9g1rGUUiQE43m",
+    "Perfume": "EQDQ6DjRabTYSAxf2xrZsnsXtqcIm1bj9dF5x_h8lNjWPmH4",
+    "Sunglasses": "EQADvJxMxCHA7fRlYjoceBORf7RwKs0rzjVaKepQACMnZzG7",
+    "Guitar": "EQDJsN9OJBhKGZoWZWtkEpzkCfIu16Z9UzTWbYjeLpuHdT5f",
+    "Camera": "EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG",
+    "Surfboard": "EQDr4xn5_GoCzDxhGJMek7fv3nm6W7bhRvlDSBjcNZul52tZ",
+    "Telescope": "EQAwzubeoJwnqmmBuTPpnUSurRzWPB8ERzcfzx55Z2YjE0jx",
+    "Yacht": "EQBayCY2wZwrVBExNfLL8v9K0mHNmrQTntZldgpYiRwB_QKK",
+    "Motorcycle": "EQDL7HMbca0FufrjHFcRoiLkEiOXkXoO_vH2gVUN8JNp4khK",
+    "Helicopter": "EQBaOL8mH5YywkXjkps65X1OLPNH7pns4YcfLmaVpFaoNKZn",
+    "Jetpack": "EQBw2tO5UaJ4c_YXt3I8y5KD0k37staZxedV2O5HmryiK0dN",
+    "Hoverboard": "EQAOYYJib8K6-91TjeOYRbWEtbtRJHXKoWltnULwdaqd7mR5",
+    "RacingCar": "EQCZxxFMS-y1hcGADL6EPB7usNstQqD9u-yBaYpXVVMr75NF",
+    "Spaceship": "EQAtFU9GrGfix4UG9DOivN58QxvgBJUaAZ_pdZBZCmbhKo4P",
+    "TimeMachine": "EQCDBbQYbv3n91TwywBRD9YrJNuNVmbD3Sprpq6hWIDHVu4p",
+    "Submarine": "EQBdlKhLzezYFMCWSWTCnhpKC1uyczaBUOj3EtPjcatUsTrC",
+    "JetSki": "EQBG2o0lp-6Oy86NGEJm717BeTDAw_F5ELkgaX2l9UsfavWE",
+    "Snowmobile": "EQBMcfMAZlMUr1W3X8kdEw3fJMUAaWH4-XcmE5R5RfFIY0E2",
+    "Parachute": "EQCwEFfUbbR-22fn3VgxUpBil7bwBQqEHm7wgQYbWY9c08YJ",
+    "HotAirBalloon": "EQDumy3bnZYzV4bSWMSSZkmXqx50XuH5d9RlX_yEi2FNlivk",
+    "Sailboat": "EQCt2C3yCRNX267B3l6h1QsU6agm4ZgTAb7NpVGiFKlBXOAA",
+    "Bicycle": "EQB4x3sT1DVdODzay3H-4VJIdOooS5-kTgyKcYMZWogPOsiq",
+    "ElectricScooter": "EQAPNu648fe_uqUoeH6V_-fIDJYea_5Xu2rXn6iZFil49bMY",
+    "Skateboard2": "EQBD8aBKC4NsnYMqtkCfPQk2EVnieynJQp1UgZVyx1VmR5Ml",
+    "Rollerblades": "EQC8WVW9DSN4PPfFlCW2AHJkXxBUHBFsvnhXiYqSTpD7tXsp",
+    "Surfboard2": "EQB8zLzEOFQK3qTyMYgPD8BuzmNwblnouqaB80PW-s2E7nct",
+    "WakeBoard": "EQA_kx2WOydXWzYUYO1DP80aHl4yhlLGYhxjPAtRPNjMgfYM",
+    "Snowboard": "EQAtgbhSHOqTxjuRLLOAab6T66FPcQWTNd_DT3VgCG1-tHJw",
+    "MountainBike": "EQCBK_JBASAA5XVz1D17Pn--kQaMWm0b9wReVtsEdRO4Tgy9",
+    "DirtBike": "EQB6AtBPOuTtQml8oSA7X8ZqJ5QmcOYYqoz92sQYXGUQrxyB",
+    "QuadBike": "EQBT9PbZBR6FGcZBSnwgo-DLpc0r7_X_8dlhG5UA6v9l9uJM",
+    "Segway": "EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs",
+    "HoverBoard2": "EQC2lsUy1SKxJEJBwj5ZCfVnLPvAqDqy5c26Xg8xS_pDTXGk",
+    "ElectricUnicycle": "EQCehrkZtKDtVe0qyvBAsrHx3hW-hroQyDrS_MZOOVYth2DG",
+    "FlyingCarpet": "EQAaTIR7oJyowDiumYLVN0oe61kGE3I6EPEn7WgHPGuWAeCy",
+    "Teleporter": "EQDqHwSzU4I_U44vSM9EDP4HGGKWy9yWjbzkpCa3K8iMBEVD",
+    "RocketBoots": "EQAIM-5QzZGXYTSZR1RGeT2g9rNpYmNPQ09_HtvaInHaTyPX",
+    "GravityBoots": "EQBzZLNIr4lie0pTfrbRsANJOtFYwY5gmngRfs84Ras5-aVN"
+}
+
+def get_collection_floor_price(collection_address, collection_name):
+    """Получение минимальной цены для конкретной коллекции"""
+    # Проверяем кэш
+    if collection_name in price_cache:
+        cache_data = price_cache[collection_name]
+        if datetime.now() - cache_data['timestamp'] < CACHE_DURATION:
+            return cache_data
+
+    max_retries = 3
+    base_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            # Получаем базовую информацию о коллекции
+            collection_response = requests.get(
+                f"https://tonapi.io/v2/nfts/collections/{collection_address}",
+                headers={
+                    'Accept': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                timeout=10
+            )
+            
+            if collection_response.status_code != 200:
+                if attempt < max_retries - 1:
+                    time.sleep(base_delay * (attempt + 1))
+                    continue
+                return None
+            
+            # Получаем предметы на продаже
+            response = requests.get(
+                f"https://tonapi.io/v2/nfts/collections/{collection_address}/items",
+                params={
+                    "limit": 1000,
+                    "offset": 0,
+                    "sale": True,
+                    "indirect_sale": True
+                },
+                headers={
+                    'Accept': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', base_delay * (attempt + 1)))
+                time.sleep(retry_after)
+                continue
+            
+            if response.status_code != 200:
+                if attempt < max_retries - 1:
+                    time.sleep(base_delay * (attempt + 1))
+                    continue
+                return None
+            
+            data = response.json()
+            items = data.get('nft_items', [])
+            
+            valid_prices = []
+            for item in items:
+                sale = item.get('sale', {})
+                if not sale:
+                    continue
+                
+                price = None
+                if isinstance(sale, dict):
+                    price_fields = ['price', 'full_price', 'value']
+                    for field in price_fields:
+                        if field in sale:
+                            if isinstance(sale[field], dict):
+                                price = sale[field].get('value')
+                            else:
+                                price = sale[field]
+                            if price:
+                                break
+                
+                if not price:
+                    continue
+                
+                try:
+                    price_value = int(price)
+                    if price_value > 0:
+                        nft_address = item.get('address')
+                        if nft_address:
+                            nft_response = requests.get(
+                                f"https://tonapi.io/v2/nfts/{nft_address}",
+                                headers={
+                                    'Accept': 'application/json',
+                                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                                },
+                                timeout=10
+                            )
+                            
+                            if nft_response.status_code == 200:
+                                nft_data = nft_response.json()
+                                preview_url = None
+                                
+                                if 'metadata' in nft_data and 'image' in nft_data['metadata']:
+                                    preview_url = nft_data['metadata']['image']
+                                
+                                if not preview_url and 'previews' in nft_data and nft_data['previews']:
+                                    preview_url = nft_data['previews'][0].get('url')
+                                
+                                if preview_url:
+                                    if preview_url.startswith('ipfs://'):
+                                        preview_url = f"https://ipfs.io/ipfs/{preview_url[7:]}"
+                                    elif not preview_url.startswith(('http://', 'https://')):
+                                        preview_url = f"https://{preview_url}"
+                                    
+                                    valid_prices.append((price_value, item, preview_url))
+                                    continue
+                            
+                except Exception:
+                    continue
+            
+            if valid_prices:
+                valid_prices.sort(key=lambda x: x[0])
+                min_price, min_price_item, preview_url = valid_prices[0]
+                result = {
+                    'price': str(min_price),
+                    'name': min_price_item.get('metadata', {}).get('name', collection_name),
+                    'address': min_price_item.get('address', ''),
+                    'image_url': preview_url,
+                    'timestamp': datetime.now()
+                }
+                price_cache[collection_name] = result
+                return result
+            
+            return None
+                
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (attempt + 1))
+            else:
+                return None
+    
+    return None
+
+def get_all_floor_prices():
+    """Получение всех минимальных цен"""
+    current_prices = {}
+    
+    # Проверяем кэш
+    current_time = datetime.now()
+    for collection_id, price_data in price_cache.items():
+        if current_time - price_data['timestamp'] < CACHE_DURATION:
+            current_prices[collection_id] = price_data
+    
+    # Получаем цены только для тех коллекций, которых нет в кэше
+    collections_to_check = [(cid, addr) for cid, addr in COLLECTIONS.items() if cid not in current_prices]
+    
+    if not collections_to_check:
+        return current_prices
+    
+    # Обрабатываем каждую коллекцию последовательно
+    for collection_id, collection_address in collections_to_check:
+        try:
+            result = get_collection_floor_price(collection_address, collection_id)
+            if result:
+                current_prices[collection_id] = result
+            
+            # Делаем небольшую паузу между запросами
+            time.sleep(1)  # 1 секунда между запросами
+            
+        except Exception as e:
+            print(f"Ошибка при получении цены для {collection_id}: {str(e)}")
+    
+    # Проверяем, что получены все цены
+    if len(current_prices) != len(COLLECTIONS):
+        missing_collections = set(COLLECTIONS.keys()) - set(current_prices.keys())
+        print(f"Получено только {len(current_prices)} из {len(COLLECTIONS)} цен")
+        print(f"Отсутствуют цены для: {', '.join(missing_collections)}")
+        return None
+        
+    return current_prices
+
+def format_ton(nano_tons):
+    """Конвертация наноТОН в ТОН с форматированием"""
+    if nano_tons is None:
+        return "Нет цены"
+    try:
+        tons = float(nano_tons) / 1000000000
+        return f"{tons:.2f} TON"
+    except (ValueError, TypeError):
+        return "Ошибка формата цены"
+
+def save_prices_to_file(prices):
+    """Сохранение цен в файл"""
+    try:
+        with open(PRICES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(prices, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Ошибка при сохранении цен в файл: {str(e)}")
+
+def load_prices_from_file():
+    """Загрузка цен из файла"""
+    try:
+        if os.path.exists(PRICES_FILE):
+            with open(PRICES_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Конвертируем строковые timestamp обратно в объекты datetime
+                for collection_id, price_data in data.items():
+                    price_data['timestamp'] = datetime.fromisoformat(price_data['timestamp'])
+                return data
+    except Exception as e:
+        print(f"Ошибка при загрузке цен из файла: {str(e)}")
+    return {}
+
+def update_prices_loop():
+    """Функция для периодического обновления цен"""
+    while True:
+        try:
+            print("Обновление цен...")
+            prices = get_all_floor_prices()
+            if prices:
+                # Конвертируем datetime в строку для сохранения в JSON
+                prices_to_save = {}
+                for collection_id, price_data in prices.items():
+                    prices_to_save[collection_id] = price_data.copy()
+                    prices_to_save[collection_id]['timestamp'] = price_data['timestamp'].isoformat()
+                
+                save_prices_to_file(prices_to_save)
+                print(f"Цены успешно обновлены и сохранены в {datetime.now().strftime('%H:%M:%S')}")
+            else:
+                print("Не удалось получить цены")
+        except Exception as e:
+            print(f"Ошибка в цикле обновления цен: {str(e)}")
+        
+        time.sleep(60)  # Пауза 1 минута
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    keyboard = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    keyboard.add(
+        telebot.types.KeyboardButton('🎁 Показать все цены'),
+        telebot.types.KeyboardButton('📊 Топ 10 дешевых'),
+        telebot.types.KeyboardButton('🔔 Подписаться'),
+        telebot.types.KeyboardButton('🔕 Отписаться')
+    )
+    
+    bot.reply_to(
+        message,
+        "Привет! Я бот для отслеживания цен на NFT телеграм-подарки.\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard
+    )
+
+@bot.message_handler(func=lambda message: message.text == '🎁 Показать все цены')
+def show_all_prices(message):
+    try:
+        processing_msg = bot.reply_to(message, "🔄 Получаю информацию о ценах...")
+        
+        prices = load_prices_from_file()
+        if not prices:
+            bot.edit_message_text(
+                "⚠️ Не удалось получить информацию о ценах. Пожалуйста, попробуйте позже.",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            return
+        
+        oldest_timestamp = min(price_data['timestamp'] for price_data in prices.values())
+        if datetime.now() - oldest_timestamp > timedelta(minutes=5):
+            bot.edit_message_text(
+                "⚠️ Данные о ценах устарели. Пожалуйста, попробуйте позже.",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            return
+        
+        response = "📊 Все цены на подарки:\n\n"
+        sorted_prices = sorted(prices.items(), key=lambda x: float(x[1]['price']))
+        
+        for collection_id, price_data in sorted_prices:
+            price_ton = format_ton(int(price_data['price']))
+            response += f"🎁 {price_data['name']}: {price_ton}\n"
+        
+        response += f"\n🕒 Последнее обновление: {oldest_timestamp.strftime('%H:%M:%S')}"
+        
+        bot.edit_message_text(
+            response,
+            chat_id=message.chat.id,
+            message_id=processing_msg.message_id
+        )
+        
+    except Exception as e:
+        print(f"Ошибка при получении цен: {str(e)}")
+        bot.reply_to(message, "❌ Произошла ошибка при получении цен. Пожалуйста, попробуйте позже.")
+
+@bot.message_handler(func=lambda message: message.text == '📊 Топ 10 дешевых')
+def show_top_10(message):
+    try:
+        processing_msg = bot.reply_to(message, "🔄 Получаю информацию о ценах...")
+        
+        prices = load_prices_from_file()
+        if not prices:
+            bot.edit_message_text(
+                "⚠️ Не удалось получить информацию о ценах. Пожалуйста, попробуйте позже.",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            return
+        
+        sorted_prices = sorted(prices.items(), key=lambda x: float(x[1]['price']))[:10]
+        
+        response = "🏆 Топ 10 самых дешевых подарков:\n\n"
+        for i, (collection_id, price_data) in enumerate(sorted_prices, 1):
+            price_ton = format_ton(int(price_data['price']))
+            response += f"{i}. {price_data['name']}: {price_ton}\n"
+        
+        bot.edit_message_text(
+            response,
+            chat_id=message.chat.id,
+            message_id=processing_msg.message_id
+        )
+        
+    except Exception as e:
+        print(f"Ошибка при получении топ 10: {str(e)}")
+        bot.reply_to(message, "❌ Произошла ошибка. Пожалуйста, попробуйте позже.")
+
+@bot.message_handler(func=lambda message: message.text == '🔔 Подписаться')
+def subscribe(message):
+    user_id = message.from_user.id
+    if user_id not in subscriptions:
+        subscriptions[user_id] = True
+        bot.reply_to(message, "✅ Вы подписались на уведомления об изменении цены")
+    else:
+        bot.reply_to(message, "ℹ️ Вы уже подписаны на уведомления")
+
+@bot.message_handler(func=lambda message: message.text == '🔕 Отписаться')
+def unsubscribe(message):
+    user_id = message.from_user.id
+    if user_id in subscriptions:
+        del subscriptions[user_id]
+        bot.reply_to(message, "✅ Вы отписались от уведомлений")
+    else:
+        bot.reply_to(message, "ℹ️ Вы не были подписаны на уведомления")
+
+def check_price_changes():
+    """Проверка изменений цены и отправка уведомлений"""
+    last_prices = {}
+    while True:
+        try:
+            current_prices = get_all_floor_prices()
+            
+            if current_prices:
+                for collection_id, info in current_prices.items():
+                    if collection_id not in last_prices:
+                        last_prices[collection_id] = info
+                        continue
+                        
+                    if not info or 'price' not in info:
+                        continue
+                        
+                    current_price = info['price']
+                    last_price = last_prices[collection_id].get('price')
+                    
+                    if current_price != last_price:
+                        price_diff = float(current_price) / 1000000000 - float(last_price) / 1000000000
+                        change_symbol = "📈" if price_diff > 0 else "📉"
+                        
+                        message = (
+                            f"{change_symbol} Изменение цены для {info['name']}!\n"
+                            f"Новая цена: {format_ton(current_price)}\n"
+                            f"Старая цена: {format_ton(last_price)}\n"
+                            f"Изменение: {price_diff:+.2f} TON\n"
+                            f"🔗 https://getgems.io/nft/{info['address']}"
+                        )
+                        
+                        for user_id in subscriptions:
+                            try:
+                                bot.send_message(user_id, message)
+                            except Exception as e:
+                                print(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+                
+                last_prices = current_prices.copy()
+                
+        except Exception as e:
+            print(f"Ошибка в check_price_changes: {str(e)}")
+        
+        time.sleep(300)  # Проверка каждые 5 минут
+
+@app.route('/')
+def index():
+    """Главная страница"""
+    return render_template('index.html')
+
+@app.route('/api/prices')
+def get_prices():
+    """API эндпоинт для получения цен"""
+    prices = load_prices_from_file()
+    if not prices:
+        return jsonify({'error': 'Не удалось загрузить цены'}), 500
+    
+    # Преобразуем цены в формат для фронтенда
+    formatted_prices = []
+    for collection_id, price_data in prices.items():
+        formatted_prices.append({
+            'id': collection_id,
+            'name': price_data['name'],
+            'price': format_ton(int(price_data['price'])),
+            'raw_price': int(price_data['price']),
+            'address': price_data['address'],
+            'image_url': price_data.get('image_url', ''),  # Добавляем URL изображения
+            'timestamp': price_data['timestamp'].strftime('%H:%M:%S')
+        })
+    
+    # Сортируем по цене
+    formatted_prices.sort(key=lambda x: x['raw_price'])
+    
+    return jsonify({
+        'prices': formatted_prices,
+        'last_update': min(p['timestamp'] for p in formatted_prices)
+    })
+
+if __name__ == '__main__':
+    # Сброс обновлений перед запуском
+    try:
+        bot.get_updates(offset=-1)
+    except Exception:
+        pass
+    
+    # Загружаем сохраненные цены в кэш при запуске
+    price_cache.update(load_prices_from_file())
+    
+    # Запуск обновления цен в отдельном потоке
+    price_updater = threading.Thread(target=update_prices_loop)
+    price_updater.daemon = True
+    price_updater.start()
+    
+    # Запуск проверки цен в отдельном потоке
+    price_checker = threading.Thread(target=check_price_changes)
+    price_checker.daemon = True
+    price_checker.start()
+    
+    # Запуск Flask в отдельном потоке
+    flask_thread = threading.Thread(target=lambda: app.run(debug=False, use_reloader=False))
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Запуск бота
+    bot.infinity_polling()
